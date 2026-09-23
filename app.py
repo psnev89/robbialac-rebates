@@ -5,7 +5,16 @@ import streamlit as st
 
 from rebates import load_catalog, load_ofertas, summarize
 
-CATALOG_PATH = Path(__file__).parent / "static" / "Premios 2026.xlsx"
+CATALOG_DIR = Path(__file__).parent / "static"
+
+
+def default_catalog() -> Path | None:
+    """Bundled catalog: prefer premios_2026.xlsx, else any .xlsx in static/."""
+    preferred = CATALOG_DIR / "premios_2026.xlsx"
+    if preferred.exists():
+        return preferred
+    candidates = sorted(CATALOG_DIR.glob("*.xlsx"))
+    return candidates[0] if candidates else None
 
 st.set_page_config(page_title="Robbialac Rebates", page_icon="🎁", layout="wide")
 st.title("Robbialac Rebates")
@@ -25,8 +34,9 @@ with col1:
             catalog_file = st.file_uploader(
                 "Substituir catálogo (opcional)", type=["xlsx"]
             )
+            default = default_catalog()
             st.caption(
-                f"A usar: {catalog_file.name if catalog_file else CATALOG_PATH.name}"
+                f"A usar: {catalog_file.name if catalog_file else (default.name if default else 'nenhum')}"
             )
         rebates_file = st.file_uploader(
             "Upload excel de rebates", type=["xlsx", "xls"]
@@ -35,8 +45,11 @@ with col1:
 
 if catalog_file is not None:
     catalog = load_catalog(catalog_file)
+elif default is not None:
+    catalog = get_catalog(str(default))
 else:
-    catalog = get_catalog(str(CATALOG_PATH))
+    st.error("Sem catálogo de prémios: carrega um ficheiro .xlsx acima.")
+    st.stop()
 
 with col1:
     with st.expander(f"Ver catálogo ({len(catalog)} prémios)"):
