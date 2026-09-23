@@ -7,6 +7,12 @@ from rebates import load_catalog, load_ofertas, summarize
 
 CATALOG_DIR = Path(__file__).parent / "static"
 
+EUR_SEPARATORS = str.maketrans(",.", ".,")
+
+
+def format_eur(value: float) -> str:
+    return f"{value:,.2f} €".translate(EUR_SEPARATORS)
+
 
 def default_catalog() -> Path | None:
     """Bundled catalog: prefer premios_2026.xlsx, else any .xlsx in static/."""
@@ -56,7 +62,12 @@ else:
 
 with col1:
     with st.expander(f"Ver catálogo ({len(catalog)} prémios)"):
-        st.dataframe(catalog, hide_index=True, width="stretch")
+        st.dataframe(
+            catalog.style.format({"preco": format_eur}),
+            column_config={"nome": "Nome", "preco": "Preço"},
+            hide_index=True,
+            width="stretch",
+        )
 
 with col2:
     with st.container(border=True):
@@ -72,21 +83,19 @@ with col2:
             summary = summarize(ofertas, catalog)
 
             m1, m2, m3 = st.columns(3)
-            m1.metric("Total gasto", f"{summary['total'].sum():.2f} €")
+            m1.metric("Total gasto", format_eur(summary["total"].sum()))
             m2.metric("Ofertas resgatadas", int(summary["quantidade"].sum()))
             m3.metric("Ofertas distintas", len(summary))
 
             st.dataframe(
-                summary[["oferta", "quantidade", "preco_unit", "total"]],
+                summary[["oferta", "quantidade", "preco_unit", "total"]].style.format(
+                    {"preco_unit": format_eur, "total": format_eur}
+                ),
                 column_config={
                     "oferta": "Oferta",
                     "quantidade": st.column_config.NumberColumn("Qtd."),
-                    "preco_unit": st.column_config.NumberColumn(
-                        "Preço unit.", format="%.2f €"
-                    ),
-                    "total": st.column_config.NumberColumn(
-                        "Total", format="%.2f €"
-                    ),
+                    "preco_unit": "Preço unit.",
+                    "total": "Total",
                 },
                 hide_index=True,
                 width="stretch",
