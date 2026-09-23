@@ -17,13 +17,16 @@ def default_catalog() -> Path | None:
     return candidates[0] if candidates else None
 
 st.set_page_config(page_title="Robbialac Rebates", page_icon="🎁", layout="wide")
-st.title("Robbialac Rebates")
+
+LOGO = CATALOG_DIR / "logo.svg"
+st.image(str(LOGO))
+
+st.title("Custo rebates +Pinta")
 
 
 @st.cache_data
 def get_catalog(path: str) -> pd.DataFrame:
     return load_catalog(path)
-
 
 col1, col2 = st.columns([1, 2])
 
