@@ -19,8 +19,9 @@ PRICE_COL = "preco"
 NET_COL = "preco_s_iva"
 VAT_COL = "iva_unit"
 VAT_RATE_COL = "taxa_iva"
+USE_VAT_COL = "usar_iva"
 DEFAULT_VAT_RATE = 23.0
-CATALOG_COLUMNS = [NAME_COL, NET_COL, VAT_RATE_COL, VAT_COL, PRICE_COL]
+CATALOG_COLUMNS = [NAME_COL, NET_COL, VAT_RATE_COL, VAT_COL, PRICE_COL, USE_VAT_COL]
 
 
 def round_money(value) -> float:
@@ -79,6 +80,15 @@ def _norm_key(text) -> str:
     return re.sub(r"\s+", " ", str(text).replace("\xa0", " ")).strip().casefold()
 
 
+def _parse_use_vat(value) -> bool:
+    key = _norm_key(value)
+    if key in ("true", "sim", "verdadeiro", "1", "1.0"):
+        return True
+    if key in ("false", "não", "nao", "falso", "0", "0.0"):
+        return False
+    raise ValueError("A opção 'Usar preço c/ IVA' deve ser Sim ou Não.")
+
+
 def _find_cell(raw: pd.DataFrame, pattern: str, max_rows: int = 10):
     """First cell (row, col) matching `pattern` near the top of the sheet."""
     for r in range(min(max_rows, len(raw))):
@@ -124,7 +134,7 @@ def _locate_columns(raw: pd.DataFrame):
     )
 
 
-def clean_catalog(df: pd.DataFrame) -> pd.DataFrame:
+def clean_catalog(df: pd.DataFrame, *, legacy_threshold: float = 50.0) -> pd.DataFrame:
     """Normalize names, gross prices and product rates, dropping duplicate names.
 
     Shared by load_catalog (fresh files) and the UI (edited tables), so an
@@ -138,11 +148,11 @@ def clean_catalog(df: pd.DataFrame) -> pd.DataFrame:
     )
     out = out[out[NAME_COL].notna() & (out[NAME_COL] != "")]
     out = out.loc[~out[NAME_COL].map(_norm_key).duplicated()].reset_index(drop=True)
-    return add_price_vat(out)
+    return add_price_vat(out, legacy_threshold=legacy_threshold)
 
 
-def load_catalog(source: Source) -> pd.DataFrame:
-    """Read gross catalog prices and optional per-product VAT percentages."""
+def load_catalog(source: Source, *, legacy_threshold: float = 50.0) -> pd.DataFrame:
+    """Read gross prices, product rates and optional rebate VAT choices."""
     with pd.ExcelFile(source, engine="openpyxl") as workbook:
         raw = pd.read_excel(workbook, header=None)
         name_c, price_c, start = _locate_columns(raw)
@@ -163,7 +173,13 @@ def load_catalog(source: Source) -> pd.DataFrame:
                 else cell.value
                 for (cell,) in cells
             ]
-    return clean_catalog(df)
+        choice_c = next(
+            (labels[label] for label in ("usar preço c/ iva", "usar preco c/ iva", USE_VAT_COL) if label in labels),
+            None,
+        )
+        if choice_c is not None:
+            df[USE_VAT_COL] = raw.iloc[start:, choice_c]
+    return clean_catalog(df, legacy_threshold=legacy_threshold)
 
 
 def load_ofertas(source: Source) -> pd.Series:
@@ -199,28 +215,24 @@ def summarize(ofertas: pd.Series, catalog: pd.DataFrame) -> pd.DataFrame:
                 "preco_unit": price,
                 "preco_unit_s_iva": product[NET_COL] if product is not None else 0.0,
                 VAT_RATE_COL: product[VAT_RATE_COL] if product is not None else 0.0,
+                USE_VAT_COL: product[USE_VAT_COL] if product is not None else False,
                 "total": round_money(price * qty),
                 "matched": product is not None,
             }
         )
     return (
         pd.DataFrame(rows, columns=[
-            "oferta", "quantidade", "preco_unit", "preco_unit_s_iva", VAT_RATE_COL, "total", "matched",
+            "oferta", "quantidade", "preco_unit", "preco_unit_s_iva", VAT_RATE_COL, USE_VAT_COL, "total", "matched",
         ])
         .sort_values("total", ascending=False)
         .reset_index(drop=True)
     )
 
 
-def add_vat_split(df: pd.DataFrame, threshold: float = 50.0) -> pd.DataFrame:
-    """Use gross unit cost above the limit, net unit cost at or below it.
-
-    The threshold affects rebate costs only; catalog prices and rates never
-    change. The unit decision is made before multiplying by quantity.
-    """
-    threshold = _parse_amount(threshold)
+def add_vat_split(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply each product's VAT choice to rebate costs before multiplying by quantity."""
     out = df.copy()
-    includes_vat = out["preco_unit"] > threshold
+    includes_vat = out[USE_VAT_COL].map(_parse_use_vat).astype(bool)
     out["preco_aplicado"] = out["preco_unit"].where(includes_vat, out["preco_unit_s_iva"])
     out["criterio"] = includes_vat.map({True: "Com IVA", False: "Sem IVA"})
     out["total_s_iva"] = (out["preco_unit_s_iva"] * out["quantidade"]).map(round_money)
@@ -230,8 +242,8 @@ def add_vat_split(df: pd.DataFrame, threshold: float = 50.0) -> pd.DataFrame:
     return out.sort_values("total", ascending=False).reset_index(drop=True)
 
 
-def add_price_vat(df: pd.DataFrame) -> pd.DataFrame:
-    """Derive net price and VAT from the gross price and each product's rate."""
+def add_price_vat(df: pd.DataFrame, *, legacy_threshold: float = 50.0) -> pd.DataFrame:
+    """Derive catalog prices and initialize only missing rebate choices from the old rule."""
     out = df.copy()
     out[PRICE_COL] = out[PRICE_COL].map(normalize_price).map(_parse_amount)
     if VAT_RATE_COL not in out:
@@ -244,13 +256,20 @@ def add_price_vat(df: pd.DataFrame) -> pd.DataFrame:
         for gross, rate in zip(out[PRICE_COL], out[VAT_RATE_COL])
     ]
     out[VAT_COL] = (out[PRICE_COL] - out[NET_COL]).map(round_money)
+    choices = out.get(USE_VAT_COL, pd.Series(None, index=out.index, dtype=object)).astype(object)
+    missing = choices.isna() | choices.eq("")
+    defaults = out[PRICE_COL] > _parse_amount(legacy_threshold)
+    out[USE_VAT_COL] = choices.where(~missing, defaults).map(_parse_use_vat).astype(bool)
     return out[CATALOG_COLUMNS]
 
 
 def edit_catalog_row(df: pd.DataFrame, row: int, column: str, value) -> pd.DataFrame:
     out = add_price_vat(df)
-    if column not in (NAME_COL, NET_COL, PRICE_COL, VAT_RATE_COL) or row not in out.index:
+    if column not in (NAME_COL, NET_COL, PRICE_COL, VAT_RATE_COL, USE_VAT_COL) or row not in out.index:
         raise ValueError("Produto ou coluna não editável.")
+    if column == USE_VAT_COL:
+        out.at[row, USE_VAT_COL] = _parse_use_vat(value)
+        return out
     if column == NAME_COL:
         name = re.sub(r"\s+", " ", str(value or "")).strip()
         if not name:
@@ -285,5 +304,5 @@ def add_missing(catalog: pd.DataFrame, names) -> pd.DataFrame:
             new.append(n)
     if not new:
         return catalog
-    extra = pd.DataFrame({NAME_COL: new, PRICE_COL: 0.0, VAT_RATE_COL: DEFAULT_VAT_RATE})
+    extra = pd.DataFrame({NAME_COL: new, PRICE_COL: 0.0, VAT_RATE_COL: DEFAULT_VAT_RATE, USE_VAT_COL: False})
     return pd.concat([catalog, extra], ignore_index=True)

@@ -7,6 +7,8 @@ import streamlit as st
 from catalog_editor import catalog_editor
 from rebates import (
     DEFAULT_VAT_RATE,
+    NAME_COL,
+    USE_VAT_COL,
     VAT_RATE_COL,
     add_missing,
     add_price_vat,
@@ -60,11 +62,11 @@ def get_catalog(path: str) -> pd.DataFrame:
     return load_catalog(path)
 
 
-def _source_key(upload) -> tuple | None:
-    if upload is not None:
-        return ("upload", upload.name, getattr(upload, "file_id", upload.size))
-    default = default_catalog()
-    return ("default", str(default)) if default else None
+def _source_key(uploaded_file) -> tuple | None:
+    if uploaded_file is not None:
+        return ("upload", uploaded_file.name, getattr(uploaded_file, "file_id", uploaded_file.size))
+    default_path = default_catalog()
+    return ("default", str(default_path)) if default_path else None
 
 
 # The catalog lives in session state: edits and auto-imported rows persist
@@ -86,14 +88,16 @@ if src_key is not None and st.session_state.get("catalog_src") != src_key:
         st.session_state.catalog_selected = []
 catalog = st.session_state.get("catalog")
 
-# The rebate limit affects the summary only, never catalog prices or rates.
-# Keep the previous limit when migrating an already-open session.
-# Each product's gross price and VAT rate determine its net catalog price.
-st.session_state.setdefault("rebate_threshold", st.session_state.get("iva_threshold", 50.0))
+# Each product's checkbox picks the rebate cost basis; it never changes prices.
+# Sessions/catalogs saved before the checkbox existed initialize it once from
+# the previous limit rule (gross > limit used the gross cost).
+legacy_threshold = st.session_state.pop(
+    "rebate_threshold", st.session_state.pop("iva_threshold", 50.0)
+)
 if catalog is not None:
-    if VAT_RATE_COL not in catalog:
+    if VAT_RATE_COL not in catalog or USE_VAT_COL not in catalog:
         st.session_state.catalog_version += 1
-    catalog = add_price_vat(catalog)
+    catalog = add_price_vat(catalog, legacy_threshold=legacy_threshold)
     st.session_state.catalog = catalog
 
 
@@ -105,6 +109,8 @@ def _apply_catalog_edits(response):
     st.session_state.pop("catalog_error", None)
     try:
         if response["row"] == "new":
+            if response["column"] != NAME_COL:
+                return
             name = str(response["value"] or "").strip()
             if not name:
                 raise ValueError("Introduz o nome do novo produto.")
@@ -143,20 +149,9 @@ with tab_rebates:
         rebates_file = st.file_uploader(
             "Ficheiro de rebates", type=["xlsx", "xls"], label_visibility="collapsed"
         )
-        limit_col, _ = st.columns([1, 2])
-        rebate_threshold = limit_col.number_input(
-            "Limite por produto (€ c/ IVA)",
-            min_value=0.0,
-            step=1.0,
-            format="%.2f",
-            key="rebate_threshold",
-            help="Compara o preço total unitário do catálogo com este limite, antes de multiplicar "
-            "pela quantidade. Até ao limite, usa o preço s/ IVA; acima, usa o preço c/ IVA. "
-            "Não altera o catálogo. 0 = usar o preço total de todos os produtos com preço positivo.",
-        )
         st.caption(
-            f"Preço total unitário até {format_eur(rebate_threshold)}: custo sem IVA. "
-            "Acima do limite: custo com IVA."
+            "Cada produto usa o preço c/ IVA ou s/ IVA conforme a checkbox "
+            "«Usar preço c/ IVA» no separador Catálogo."
         )
 
     if rebates_file is None:
@@ -166,7 +161,7 @@ with tab_rebates:
     else:
         try:
             ofertas = load_ofertas(rebates_file)
-            summary = add_vat_split(summarize(ofertas, catalog), rebate_threshold)
+            summary = add_vat_split(summarize(ofertas, catalog))
         except ValueError as e:
             st.error(str(e))
             st.stop()
@@ -174,15 +169,15 @@ with tab_rebates:
         totals_by_criterion = summary.groupby("criterio")["total"].sum()
         with st.container(horizontal=True):
             st.metric(
-                f"Total rebates ≤ {format_eur(rebate_threshold)}",
+                "Total rebates s/ IVA",
                 format_eur(totals_by_criterion.get("Sem IVA", 0.0)),
-                help="Custo sem IVA dos produtos cujo preço total unitário é menor ou igual ao limiar, "
+                help="Custo dos produtos com a checkbox «Usar preço c/ IVA» desmarcada, "
                 "já multiplicado pelas quantidades resgatadas.",
             )
             st.metric(
-                f"Total rebates > {format_eur(rebate_threshold)}",
+                "Total rebates c/ IVA",
                 format_eur(totals_by_criterion.get("Com IVA", 0.0)),
-                help="Custo com IVA dos produtos cujo preço total unitário ultrapassa o limiar, "
+                help="Custo dos produtos com a checkbox «Usar preço c/ IVA» marcada, "
                 "já multiplicado pelas quantidades resgatadas.",
             )
             st.metric("Total rebates", format_eur(summary["total"].sum()))
@@ -283,7 +278,8 @@ with tab_catalog:
         st.caption(
             f"Cada produto tem a sua taxa de IVA. Produtos sem taxa definida começam com "
             f"{DEFAULT_VAT_RATE:.0f}% — revê e ajusta as taxas na tabela. "
-            "O limite dos rebates não altera os preços deste catálogo."
+            "A checkbox «Usar preço c/ IVA» escolhe o custo usado nos rebates, "
+            "sem alterar os preços do catálogo."
         )
 
     if catalog is None:
@@ -315,6 +311,7 @@ with tab_catalog:
                 "iva_unit": "IVA (€)",
                 "preco_s_iva": "Preço s/ IVA",
                 "preco": "Preço total",
+                USE_VAT_COL: "Usar preço c/ IVA",
             }
         )
         st.download_button(

@@ -2,7 +2,15 @@ import pandas as pd
 import streamlit as st
 from st_aggrid import AgGrid, JsCode, StAggridTheme
 
-from rebates import DEFAULT_VAT_RATE, NAME_COL, NET_COL, PRICE_COL, VAT_COL, VAT_RATE_COL
+from rebates import (
+    DEFAULT_VAT_RATE,
+    NAME_COL,
+    NET_COL,
+    PRICE_COL,
+    USE_VAT_COL,
+    VAT_COL,
+    VAT_RATE_COL,
+)
 
 
 def catalog_editor(catalog: pd.DataFrame, key: str, on_change):
@@ -77,6 +85,19 @@ def catalog_editor(catalog: pd.DataFrame, key: str, on_change):
                     "headerTooltip": "Calculado a partir do preço total e da taxa de IVA do produto.",
                 },
                 {**money_column, "field": PRICE_COL, "headerName": "Preço total (c/ IVA)"},
+                {
+                    "field": USE_VAT_COL,
+                    "headerName": "Usar preço c/ IVA",
+                    "minWidth": 150,
+                    "flex": 1,
+                    "cellDataType": False,
+                    "cellRenderer": "agCheckboxCellRenderer",
+                    "cellEditor": "agCheckboxCellEditor",
+                    "editable": editable,
+                    "headerTooltip": "Marcado: o rebate usa o preço total (c/ IVA). "
+                    "Desmarcado: usa o preço s/ IVA.",
+                    "getQuickFilterText": JsCode("function() { return ''; }"),
+                },
             ],
             "defaultColDef": {"resizable": True, "sortable": True, "suppressMovable": True},
             "quickFilterText": search.strip(),
@@ -98,7 +119,7 @@ def catalog_editor(catalog: pd.DataFrame, key: str, on_change):
             "overlayNoRowsTemplate": "<span role='status'>Nenhum produto encontrado.</span>",
             "pinnedBottomRowData": [{
                 NAME_COL: "", NET_COL: 0.0, VAT_RATE_COL: DEFAULT_VAT_RATE,
-                VAT_COL: 0.0, PRICE_COL: 0.0, "_row_id": "new",
+                VAT_COL: 0.0, PRICE_COL: 0.0, USE_VAT_COL: False, "_row_id": "new",
             }],
             "getRowId": JsCode("function(p) { return p.data._row_id; }"),
             "onGridReady": JsCode("""

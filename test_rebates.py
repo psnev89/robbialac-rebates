@@ -9,10 +9,12 @@ from rebates import (
 )
 
 
-def make_catalog(prices, rates=None):
+def make_catalog(prices, rates=None, use_vat=None):
     data = {"nome": [f"Produto {i}" for i in range(len(prices))], "preco": prices}
     if rates is not None:
         data["taxa_iva"] = rates
+    if use_vat is not None:
+        data["usar_iva"] = use_vat
     return add_price_vat(pd.DataFrame(data))
 
 
@@ -160,56 +162,93 @@ class CatalogEditingTests(unittest.TestCase):
         self.assertEqual(len(self.catalog), 2)
 
 
-class RebateThresholdTests(unittest.TestCase):
-    def summary(self, catalog, threshold, offers=None):
+class RebateChoiceTests(unittest.TestCase):
+    def summary(self, catalog, offers=None):
         if offers is None:
             offers = catalog.nome
-        return add_vat_split(summarize(pd.Series(offers), catalog), threshold)
+        return add_vat_split(summarize(pd.Series(offers), catalog))
 
-    def test_threshold_compares_gross_including_equal_boundary(self):
-        catalog = make_catalog([49.99, 50.0, 50.01], [23, 23, 23])
-        summary = self.summary(catalog, 50).set_index("oferta")
-        self.assertEqual(summary.loc["Produto 0", "preco_aplicado"], 40.64)
-        self.assertEqual(summary.loc["Produto 1", "preco_aplicado"], 40.65)
-        self.assertEqual(summary.loc["Produto 2", "preco_aplicado"], 50.01)
+    def test_checkbox_overrides_any_price_boundary(self):
+        catalog = make_catalog([49.2, 123.0], [23, 23], [True, False])
+        summary = self.summary(catalog).set_index("oferta")
+        self.assertEqual(summary.loc["Produto 0", "preco_aplicado"], 49.2)
+        self.assertEqual(summary.loc["Produto 0", "criterio"], "Com IVA")
+        self.assertEqual(summary.loc["Produto 1", "preco_aplicado"], 100.0)
         self.assertEqual(summary.loc["Produto 1", "criterio"], "Sem IVA")
-        self.assertEqual(summary.loc["Produto 2", "criterio"], "Com IVA")
+        self.assertEqual(summary.iva.sum(), 9.2)
 
-    def test_above_gross_limit_uses_gross_even_when_net_is_below(self):
-        summary = self.summary(make_catalog([60.0], [23]), 50)
-        self.assertEqual(summary.iloc[0].preco_aplicado, 60.0)
-        self.assertEqual(summary.iloc[0].total_s_iva, 48.78)
-        self.assertEqual(summary.iloc[0].iva, 11.22)
+    def test_choice_is_applied_before_multiplying_quantity(self):
+        catalog = make_catalog([49.2], [23], [False])
+        self.assertEqual(self.summary(catalog, ["Produto 0"] * 3).iloc[0].total, 120.0)
+        catalog = edit_catalog_row(catalog, 0, "usar_iva", True)
+        self.assertEqual(self.summary(catalog, ["Produto 0"] * 3).iloc[0].total, 147.6)
 
-    def test_threshold_is_per_unit_not_aggregate(self):
-        catalog = make_catalog([49.2], [23])
-        summary = self.summary(catalog, 50, ["Produto 0"] * 3)
-        self.assertEqual(summary.iloc[0].total, 120.0)
-        self.assertEqual(summary.iloc[0].iva, 0.0)
+    def test_mixed_rates_follow_individual_choices(self):
+        catalog = make_catalog([106.0, 113.0, 123.0, 100.0], [6, 13, 23, 0], [False, True, False, True])
+        summary = self.summary(catalog).set_index("oferta")
+        self.assertEqual(summary.loc[catalog.nome, "preco_aplicado"].tolist(), [100.0, 113.0, 100.0, 100.0])
+        self.assertEqual(summary.iva.sum(), 13.0)
 
-    def test_mixed_product_rates_below_limit(self):
-        catalog = make_catalog([50.0, 50.0, 50.0, 50.0], [6, 13, 23, 0])
-        summary = self.summary(catalog, 50).set_index("oferta")
-        self.assertEqual(summary.loc[catalog.nome, "preco_aplicado"].tolist(), [47.17, 44.25, 40.65, 50.0])
-
-    def test_threshold_changes_do_not_mutate_catalog(self):
-        catalog = make_catalog([49.2, 60.0, 113.0], [23, 23, 13])
+    def test_toggling_choice_never_changes_catalog_prices_or_rates(self):
+        catalog = make_catalog([49.2, 113.0], [23, 13], [False, True])
         original = catalog.copy()
-        initial = self.summary(catalog, 50)
-        raised = self.summary(catalog, 150)
-        restored = self.summary(catalog, 50)
-        self.assertEqual(raised.total.sum(), 188.78)
-        pd.testing.assert_frame_equal(initial, restored)
+        changed = edit_catalog_row(catalog, 0, "usar_iva", True)
+        pd.testing.assert_frame_equal(changed.drop(columns="usar_iva"), original.drop(columns="usar_iva"))
+        self.assertEqual(changed.usar_iva.tolist(), [True, True])
+        restored = edit_catalog_row(changed, 0, "usar_iva", False)
+        pd.testing.assert_frame_equal(restored, original)
+        self.summary(catalog)
         pd.testing.assert_frame_equal(catalog, original)
 
-    def test_zero_limit_uses_gross_for_positive_prices(self):
-        catalog = make_catalog([49.2, 60.0], [23, 6])
-        summary = self.summary(catalog, 0)
-        self.assertEqual(summary.total.sum(), 109.2)
+    def test_price_and_rate_edits_do_not_change_choice(self):
+        catalog = make_catalog([10.0, 123.0], [23, 23], [False, True])
+        catalog = edit_catalog_row(catalog, 0, "preco", 500.0)
+        catalog = edit_catalog_row(catalog, 1, "preco", 1.0)
+        catalog = edit_catalog_row(catalog, 0, "taxa_iva", 6.0)
+        self.assertEqual(catalog.usar_iva.tolist(), [False, True])
+
+    def test_missing_choices_use_legacy_limit_once(self):
+        raw = pd.DataFrame({"nome": ["A", "B", "C"], "preco": [49.99, 50.0, 50.01]})
+        catalog = add_price_vat(raw)
+        self.assertEqual(catalog.usar_iva.tolist(), [False, False, True])
+        self.assertEqual(add_price_vat(raw, legacy_threshold=60).usar_iva.tolist(), [False, False, False])
+        self.assertEqual(add_price_vat(catalog, legacy_threshold=0).usar_iva.tolist(), [False, False, True])
+
+    def test_excel_round_trip_keeps_true_and_false_choices(self):
+        catalog = make_catalog([49.2, 123.0], [23, 23], [True, False])
+        export = catalog.rename(columns={
+            "nome": "Nome", "preco": "Preço total", "preco_s_iva": "Preço s/ IVA",
+            "taxa_iva": "Taxa IVA (%)", "iva_unit": "IVA (€)", "usar_iva": "Usar preço c/ IVA",
+        })
+        loaded = load_catalog(excel_buffer(export))
+        self.assertEqual(loaded.usar_iva.tolist(), [True, False])
+        pd.testing.assert_frame_equal(loaded, catalog)
+
+    def test_legacy_import_accepts_previous_custom_limit(self):
+        raw = pd.DataFrame({"Nome": ["A", "B"], "Preço total": [60.0, 120.0]})
+        loaded = load_catalog(excel_buffer(raw), legacy_threshold=100.0)
+        self.assertEqual(loaded.usar_iva.tolist(), [False, True])
+
+    def test_boolean_strings_and_excel_numbers_are_parsed_explicitly(self):
+        flags = ["true", "False", "sim", "não", "0", "1", 0, 1, False, True]
+        catalog = make_catalog([123.0] * len(flags), use_vat=flags)
+        self.assertEqual(catalog.usar_iva.tolist(), [True, False, True, False, False, True, False, True, False, True])
+
+    def test_invalid_checkbox_values_are_rejected(self):
+        catalog = make_catalog([123.0])
+        for value in ["talvez", 2, -1, None, "", float("nan")]:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                edit_catalog_row(catalog, 0, "usar_iva", value)
+
+    def test_added_products_start_unchecked_without_changing_existing_choices(self):
+        catalog = add_price_vat(add_missing(make_catalog([123.0], use_vat=[True]), ["Novo"]))
+        self.assertEqual(catalog.usar_iva.tolist(), [True, False])
+        catalog = edit_catalog_row(catalog, 1, "preco", 123.0)
+        self.assertEqual(catalog.usar_iva.tolist(), [True, False])
 
     def test_totals_reconcile_and_unmatched_offers_cost_zero(self):
-        catalog = make_catalog([49.2, 113.0], [23, 13])
-        summary = self.summary(catalog, 50, [" produto 0 ", "Produto 0", "Produto 1", "Missing"])
+        catalog = make_catalog([49.2, 113.0], [23, 13], [False, True])
+        summary = self.summary(catalog, [" produto 0 ", "Produto 0", "Produto 1", "Missing"])
         self.assertEqual(summary.total.sum(), 193.0)
         self.assertEqual(summary.total_s_iva.sum(), 180.0)
         self.assertEqual(summary.iva.sum(), 13.0)
@@ -217,15 +256,9 @@ class RebateThresholdTests(unittest.TestCase):
         self.assertTrue(((summary.total_s_iva + summary.iva).round(2) == summary.total).all())
 
     def test_empty_offers_are_supported(self):
-        summary = self.summary(make_catalog([123.0]), 50, [])
+        summary = self.summary(make_catalog([123.0]), [])
         self.assertTrue(summary.empty)
         self.assertEqual(summary.total.sum(), 0)
-
-    def test_invalid_threshold_is_rejected(self):
-        catalog = make_catalog([123.0])
-        for threshold in [-1, float("inf"), float("nan")]:
-            with self.subTest(threshold=threshold), self.assertRaises(ValueError):
-                self.summary(catalog, threshold)
 
 
 class CatalogEditorTests(unittest.TestCase):
@@ -262,7 +295,7 @@ class CatalogEditorTests(unittest.TestCase):
 
 
 class AppTests(unittest.TestCase):
-    def test_rebate_limit_changes_summary_without_changing_catalog(self):
+    def test_product_choices_change_metrics_without_changing_prices(self):
         from pathlib import Path
         from unittest.mock import patch
         from streamlit.testing.v1 import AppTest
@@ -280,10 +313,9 @@ class AppTests(unittest.TestCase):
             app.session_state["catalog"] = catalog.copy()
             app.run()
             self.assertFalse(app.exception)
-            self.assertEqual(len(app.number_input), 1)
-            self.assertEqual(app.number_input[0].label, "Limite por produto (€ c/ IVA)")
+            self.assertEqual(len(app.number_input), 0)
             self.assertEqual([metric.label for metric in app.metric], [
-                "Total rebates ≤ 50,00 €", "Total rebates > 50,00 €", "Total rebates",
+                "Total rebates s/ IVA", "Total rebates c/ IVA", "Total rebates",
                 "IVA incluído no custo", "Ofertas resgatadas",
             ])
             self.assertEqual([metric.value for metric in app.metric], ["160,65 €", "113,00 €", "273,65 €", "13,00 €", "5"])
@@ -292,19 +324,21 @@ class AppTests(unittest.TestCase):
             self.assertEqual([metric.value for metric in app.metric], ["160,65 €", "113,00 €", "273,65 €", "13,00 €", "5"])
             pd.testing.assert_frame_equal(app.session_state["catalog"], catalog)
             cases = [
-                (150.0, ["260,65 €", "0,00 €", "260,65 €", "0,00 €", "5"]),
-                (0.0, ["0,00 €", "310,60 €", "310,60 €", "49,95 €", "5"]),
-                (49.2, ["120,00 €", "163,00 €", "283,00 €", "22,35 €", "5"]),
-                (50.0, ["160,65 €", "113,00 €", "273,65 €", "13,00 €", "5"]),
+                ([False, False, False], ["260,65 €", "0,00 €", "260,65 €", "0,00 €", "5"]),
+                ([True, True, True], ["0,00 €", "310,60 €", "310,60 €", "49,95 €", "5"]),
+                ([False, True, True], ["120,00 €", "163,00 €", "283,00 €", "22,35 €", "5"]),
+                ([False, True, False], ["160,65 €", "113,00 €", "273,65 €", "13,00 €", "5"]),
             ]
-            for threshold, expected in cases:
-                app.number_input(key="rebate_threshold").set_value(threshold).run()
+            for choices, expected in cases:
+                updated = catalog.copy()
+                updated["usar_iva"] = choices
+                app.session_state["catalog"] = updated
+                app.run()
                 self.assertFalse(app.exception)
                 self.assertEqual([metric.value for metric in app.metric], expected)
-                label_amount = f"{threshold:.2f}".replace(".", ",")
-                self.assertEqual(app.metric[0].label, f"Total rebates ≤ {label_amount} €")
-                self.assertEqual(app.metric[1].label, f"Total rebates > {label_amount} €")
-                pd.testing.assert_frame_equal(app.session_state["catalog"], catalog)
+                pd.testing.assert_frame_equal(
+                    app.session_state["catalog"].drop(columns="usar_iva"), catalog.drop(columns="usar_iva"),
+                )
             offer_source.return_value = pd.Series(dtype=str)
             app.run()
             self.assertFalse(app.exception)
