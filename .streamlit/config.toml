@@ -1,0 +1,27 @@
+[theme]
+base = "light"
+primaryColor = "#2563EB"
+backgroundColor = "#F8FAFC"
+secondaryBackgroundColor = "#EFF6FF"
+textColor = "#172554"
+linkColor = "#1D4ED8"
+borderColor = "#6B8CAE"
+dataframeBorderColor = "#6B8CAE"
+dataframeHeaderBackgroundColor = "#DBEAFE"
+blueColor = "#2563EB"
+blueBackgroundColor = "#DBEAFE"
+blueTextColor = "#1E40AF"
+showWidgetBorder = true
+
+[theme.dark]
+primaryColor = "#60A5FA"
+backgroundColor = "#0B1220"
+secondaryBackgroundColor = "#15233B"
+textColor = "#E2E8F0"
+linkColor = "#93C5FD"
+borderColor = "#536C91"
+dataframeBorderColor = "#536C91"
+dataframeHeaderBackgroundColor = "#172D4D"
+blueColor = "#60A5FA"
+blueBackgroundColor = "#172D4D"
+blueTextColor = "#BFDBFE"
