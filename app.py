@@ -1,3 +1,4 @@
+import os
 from io import BytesIO
 from pathlib import Path
 
@@ -5,6 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from catalog_editor import catalog_editor
+from persistence import commit_catalog
 from rebates import (
     DEFAULT_VAT_RATE,
     NAME_COL,
@@ -46,6 +48,37 @@ def to_xlsx_bytes(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
+def catalog_export(catalog: pd.DataFrame) -> pd.DataFrame:
+    """Catalog with the Portuguese headers used by downloads and the git save."""
+    return catalog.rename(
+        columns={
+            "nome": "Nome",
+            VAT_RATE_COL: "Taxa IVA (%)",
+            "iva_unit": "IVA (€)",
+            "preco_s_iva": "Preço s/ IVA",
+            "preco": "Preço total",
+            USE_VAT_COL: "Usar preço c/ IVA",
+        }
+    )
+
+
+def github_config() -> tuple[str, str, str]:
+    """Return (token, repo, branch). Empty token means saving is not configured."""
+    try:
+        token = st.secrets.get("GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN", "")
+    except Exception:
+        token = os.environ.get("GITHUB_TOKEN", "")
+    try:
+        repo = st.secrets.get("GITHUB_REPO") or os.environ.get(
+            "GITHUB_REPO", "psnev89/robbialac-rebates"
+        )
+        branch = st.secrets.get("GITHUB_BRANCH") or os.environ.get("GITHUB_BRANCH", "main")
+    except Exception:
+        repo = os.environ.get("GITHUB_REPO", "psnev89/robbialac-rebates")
+        branch = os.environ.get("GITHUB_BRANCH", "main")
+    return token, repo, branch
+
+
 st.set_page_config(page_title="Robbialac Rebates", page_icon="🎁", layout="wide")
 
 LOGO = CATALOG_DIR / "logo.svg"
@@ -83,6 +116,7 @@ if src_key is not None and st.session_state.get("catalog_src") != src_key:
         catalog_load_error = str(error)
     else:
         st.session_state.catalog = loaded_catalog
+        st.session_state.catalog_baseline = loaded_catalog.copy()
         st.session_state.catalog_src = src_key
         st.session_state.catalog_version += 1
         st.session_state.catalog_selected = []
@@ -132,6 +166,24 @@ def _apply_catalog_edits(response):
 def _import_offers(names):
     st.session_state.catalog = add_missing(st.session_state.catalog, names)
     st.session_state.catalog_imported = True
+
+
+def _save_catalog():
+    """Commit the session catalog to GitHub so the deployed app reloads it."""
+    st.session_state.pop("catalog_error", None)
+    st.session_state.pop("catalog_saved", None)
+    token, repo, branch = github_config()
+    try:
+        sha = commit_catalog(
+            to_xlsx_bytes(catalog_export(st.session_state.catalog)), repo, token, branch=branch
+        )
+    except ValueError as error:
+        st.session_state.catalog_error = str(error)
+        return
+    st.session_state.catalog_baseline = st.session_state.catalog.copy()
+    st.session_state.catalog_saved = (
+        f"Catálogo gravado (commit {sha[:7]}). A app vai atualizar-se."
+    )
 
 
 def _delete_selected():
@@ -248,18 +300,12 @@ with tab_rebates:
             "oferta", "quantidade", VAT_RATE_COL, "preco_unit", "preco_unit_s_iva",
             "preco_aplicado", "criterio", "total_s_iva", "iva", "total",
         ]).rename(columns=summary_labels)
-        d1, d2 = st.columns(2)
-        d1.download_button(
-            "Download resumo (CSV)",
-            export.to_csv(index=False, float_format="%.2f").encode("utf-8-sig"),
-            "resumo_rebates.csv",
-            "text/csv",
-        )
-        d2.download_button(
+        st.download_button(
             "Download resumo (Excel)",
-            to_xlsx_bytes(export),
-            "resumo_rebates.xlsx",
-            XLSX_MIME,
+            icon="📥",
+            data=to_xlsx_bytes(export),
+            file_name="resumo_rebates.xlsx",
+            mime=XLSX_MIME,
         )
 
 with tab_catalog:
@@ -299,24 +345,58 @@ with tab_catalog:
         )
         if st.session_state.get("catalog_error"):
             st.error(st.session_state.catalog_error)
-        st.button(
+
+        flex = st.container(horizontal=True)
+        baseline = st.session_state.get("catalog_baseline")
+        dirty = baseline is not None and not catalog.equals(baseline)
+        if dirty:
+            st.caption("Tens alterações ao catálogo por gravar.")
+        token, _, _ = github_config()
+        flex.button(
+            "Gravar catálogo",
+            icon="💾",
+            disabled=not dirty or not token,
+            on_click=_save_catalog,
+            type="primary",
+            help=(
+                "Faz commit de static/catalogo.xlsx no GitHub. O push reinicia a app "
+                "com o catálogo novo."
+                if token
+                else "Configura GITHUB_TOKEN nas secrets da app para gravar no GitHub."
+            ),
+        )
+        # Streamlit has no per-button color: the key renders a stable
+        # `st-key-*` class that this scoped CSS turns into a danger button.
+        st.markdown(
+            """
+            <style>
+            .st-key-remove_products button:not(:disabled) {
+                background-color: #DC2626;
+                border-color: #DC2626;
+                color: #FFFFFF;
+            }
+            .st-key-remove_products button:not(:disabled):hover {
+                background-color: #B91C1C;
+                border-color: #B91C1C;
+                color: #FFFFFF;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        flex.button(
             "Remover produtos selecionados",
+            key="remove_products",
             disabled=not st.session_state.get("catalog_selected"),
             on_click=_delete_selected,
         )
-        catalog_export = catalog.rename(
-            columns={
-                "nome": "Nome",
-                VAT_RATE_COL: "Taxa IVA (%)",
-                "iva_unit": "IVA (€)",
-                "preco_s_iva": "Preço s/ IVA",
-                "preco": "Preço total",
-                USE_VAT_COL: "Usar preço c/ IVA",
-            }
-        )
-        st.download_button(
+        flex.space('stretch')
+        flex.download_button(
             "Download catálogo (Excel)",
-            to_xlsx_bytes(catalog_export),
-            "catalogo.xlsx",
-            XLSX_MIME,
+            icon="📥",
+            data=to_xlsx_bytes(catalog_export(catalog)),
+            file_name="catalogo.xlsx",
+            mime=XLSX_MIME,
         )
+        if saved := st.session_state.pop("catalog_saved", None):
+            st.success(saved)

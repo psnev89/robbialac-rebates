@@ -345,5 +345,56 @@ class AppTests(unittest.TestCase):
             self.assertEqual([metric.value for metric in app.metric], ["0,00 €"] * 4 + ["0"])
 
 
+class PersistenceTests(unittest.TestCase):
+    def _responses(self, get_status=200, get_sha="abc123", put_status=201):
+        from unittest.mock import MagicMock
+
+        get_resp = MagicMock(status_code=get_status)
+        get_resp.json.return_value = {"sha": get_sha}
+        put_resp = MagicMock(status_code=put_status)
+        put_resp.json.return_value = {"commit": {"sha": "deadbeefcafe"}}
+        return get_resp, put_resp
+
+    def test_commit_updates_existing_file_with_sha(self):
+        import base64
+        from unittest.mock import patch
+        from persistence import commit_catalog
+
+        get_resp, put_resp = self._responses()
+        with patch("persistence.requests.get", return_value=get_resp) as get, \
+             patch("persistence.requests.put", return_value=put_resp) as put:
+            sha = commit_catalog(b"XLSX-BYTES", "owner/repo", "tok")
+        self.assertEqual(sha, "deadbeefcafe")
+        self.assertEqual(get.call_args.args[0], "https://api.github.com/repos/owner/repo/contents/static/catalogo.xlsx")
+        body = put.call_args.kwargs["json"]
+        self.assertEqual(body["sha"], "abc123")
+        self.assertEqual(body["branch"], "main")
+        self.assertEqual(base64.b64decode(body["content"]), b"XLSX-BYTES")
+        self.assertEqual(put.call_args.kwargs["headers"]["Authorization"], "Bearer tok")
+
+    def test_missing_file_commits_without_sha(self):
+        from unittest.mock import patch
+        from persistence import commit_catalog
+
+        get_resp, put_resp = self._responses(get_status=404)
+        with patch("persistence.requests.get", return_value=get_resp), \
+             patch("persistence.requests.put", return_value=put_resp) as put:
+            commit_catalog(b"XLSX", "owner/repo", "tok", branch="dev")
+        body = put.call_args.kwargs["json"]
+        self.assertNotIn("sha", body)
+        self.assertEqual(body["branch"], "dev")
+
+    def test_github_errors_become_valueerror(self):
+        from unittest.mock import patch
+        from persistence import commit_catalog
+
+        for status in (401, 403, 404, 409, 500):
+            get_resp, _ = self._responses(get_status=status)
+            with self.subTest(status=status), \
+                 patch("persistence.requests.get", return_value=get_resp), \
+                 self.assertRaises(ValueError):
+                commit_catalog(b"XLSX", "owner/repo", "tok")
+
+
 if __name__ == "__main__":
     unittest.main()

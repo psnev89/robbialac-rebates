@@ -42,9 +42,11 @@ def catalog_editor(catalog: pd.DataFrame, key: str, on_change):
     data["_row_id"] = data.index.map(str)
     money_format = JsCode("""
         function(params) {
-            return Number(params.value || 0).toLocaleString('pt-PT', {
-                minimumFractionDigits: 2, maximumFractionDigits: 2
-            });
+            // pt-PT: 1.234,56 — ponto nos milhares, vírgula nos decimais.
+            // (toLocaleString('pt-PT') usa espaço, daí o formatador manual.)
+            const parts = Number(params.value || 0).toFixed(2).split('.');
+            parts[0] = parts[0].replace(/\\B(?=(\\d{3})+(?!\\d))/g, '.');
+            return parts.join(',');
         }
     """)
     editable = JsCode("function(p) { return p.data._row_id !== 'new'; }")
