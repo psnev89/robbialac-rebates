@@ -7,6 +7,8 @@ from rebates import (
     NAME_COL,
     NET_COL,
     PRICE_COL,
+    SHIPPING_COL,
+    TOTAL_COL,
     USE_VAT_COL,
     VAT_COL,
     VAT_RATE_COL,
@@ -86,7 +88,19 @@ def catalog_editor(catalog: pd.DataFrame, key: str, on_change):
                     **money_column, "field": VAT_COL, "headerName": "IVA (€)", "editable": False,
                     "headerTooltip": "Calculado a partir do preço total e da taxa de IVA do produto.",
                 },
-                {**money_column, "field": PRICE_COL, "headerName": "Preço total (c/ IVA)"},
+                {
+                    **money_column, "field": PRICE_COL, "headerName": "Preço c/ IVA",
+                    "headerTooltip": "Preço do produto com IVA, sem portes.",
+                },
+                {
+                    **money_column, "field": SHIPPING_COL, "headerName": "Portes",
+                    "headerTooltip": "Custo de portes por unidade deste produto.",
+                },
+                {
+                    **money_column, "field": TOTAL_COL, "headerName": "Preço total",
+                    "editable": False,
+                    "headerTooltip": "Preço c/ IVA + Portes. Calculado automaticamente.",
+                },
                 {
                     "field": USE_VAT_COL,
                     "headerName": "Usar preço c/ IVA",
@@ -121,7 +135,8 @@ def catalog_editor(catalog: pd.DataFrame, key: str, on_change):
             "overlayNoRowsTemplate": "<span role='status'>Nenhum produto encontrado.</span>",
             "pinnedBottomRowData": [{
                 NAME_COL: "", NET_COL: 0.0, VAT_RATE_COL: DEFAULT_VAT_RATE,
-                VAT_COL: 0.0, PRICE_COL: 0.0, USE_VAT_COL: False, "_row_id": "new",
+                VAT_COL: 0.0, PRICE_COL: 0.0, SHIPPING_COL: 0.0, TOTAL_COL: 0.0,
+                USE_VAT_COL: False, "_row_id": "new",
             }],
             "getRowId": JsCode("function(p) { return p.data._row_id; }"),
             "onGridReady": JsCode("""

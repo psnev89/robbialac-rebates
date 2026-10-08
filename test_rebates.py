@@ -9,12 +9,14 @@ from rebates import (
 )
 
 
-def make_catalog(prices, rates=None, use_vat=None):
+def make_catalog(prices, rates=None, use_vat=None, portes=None):
     data = {"nome": [f"Produto {i}" for i in range(len(prices))], "preco": prices}
     if rates is not None:
         data["taxa_iva"] = rates
     if use_vat is not None:
         data["usar_iva"] = use_vat
+    if portes is not None:
+        data["portes"] = portes
     return add_price_vat(pd.DataFrame(data))
 
 
@@ -100,6 +102,7 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(all_items.nome.tolist(), ["Produto 0", "B", "C"])
         self.assertEqual(all_items.preco.tolist(), [106.0, 0.0, 0.0])
         self.assertEqual(all_items.taxa_iva.tolist(), [6.0, 23.0, 23.0])
+        self.assertEqual(all_items.portes.tolist(), [0.0, 0.0, 0.0])
 
 
 class CatalogEditingTests(unittest.TestCase):
@@ -128,6 +131,26 @@ class CatalogEditingTests(unittest.TestCase):
     def test_edit_total_updates_net_using_product_rate(self):
         row = self.edit("preco", 212, row=1)
         self.assertEqual((row.preco_s_iva, row.iva_unit, row.preco), (200.0, 12.0, 212.0))
+
+    def test_edit_portes_accepts_amounts_and_rejects_invalid(self):
+        row = self.edit("portes", "5,90")
+        self.assertEqual(row.portes, 5.9)
+        self.assertEqual(row.preco_total, 128.9)
+        self.assertEqual(self.catalog.iloc[1].portes, 0.0)
+        for value in [-1, "abc", None]:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.edit("portes", value)
+
+    def test_preco_total_is_not_editable(self):
+        with self.assertRaises(ValueError):
+            self.edit("preco_total", 200)
+
+    def test_edit_price_or_net_updates_total_with_portes(self):
+        self.edit("portes", 10, row=1)
+        row = self.edit("preco", 200, row=1)
+        self.assertEqual((row.preco, row.portes, row.preco_total), (200.0, 10.0, 210.0))
+        row = self.edit("preco_s_iva", 100, row=1)
+        self.assertEqual((row.preco, row.portes, row.preco_total), (106.0, 10.0, 116.0))
 
     def test_vat_amount_is_calculated_not_manually_editable(self):
         with self.assertRaises(ValueError):
@@ -177,6 +200,14 @@ class RebateChoiceTests(unittest.TestCase):
         self.assertEqual(summary.loc["Produto 1", "criterio"], "Sem IVA")
         self.assertEqual(summary.iva.sum(), 9.2)
 
+    def test_portes_always_count_toward_applied_cost(self):
+        catalog = make_catalog([49.2], [23], [True], portes=[5.0])
+        row = self.summary(catalog).iloc[0]
+        self.assertEqual((row.preco_aplicado, row.total, row.total_s_iva, row.iva), (54.2, 54.2, 45.0, 9.2))
+        catalog = edit_catalog_row(catalog, 0, "usar_iva", False)
+        row = self.summary(catalog).iloc[0]
+        self.assertEqual((row.preco_aplicado, row.total, row.iva), (45.0, 45.0, 0.0))
+
     def test_choice_is_applied_before_multiplying_quantity(self):
         catalog = make_catalog([49.2], [23], [False])
         self.assertEqual(self.summary(catalog, ["Produto 0"] * 3).iloc[0].total, 120.0)
@@ -214,11 +245,35 @@ class RebateChoiceTests(unittest.TestCase):
         self.assertEqual(add_price_vat(raw, legacy_threshold=60).usar_iva.tolist(), [False, False, False])
         self.assertEqual(add_price_vat(catalog, legacy_threshold=0).usar_iva.tolist(), [False, False, True])
 
+    def test_portes_import_and_default(self):
+        # 'Preço total' inclui portes: o preço do produto é derivado pela diferença.
+        export = pd.DataFrame({
+            "Nome": ["A", "B"], "Preço total": [110.9, 115.5], "Portes": [4.9, "2,50 €"],
+        })
+        catalog = load_catalog(excel_buffer(export))
+        self.assertEqual(catalog.portes.tolist(), [4.9, 2.5])
+        self.assertEqual(catalog.preco.tolist(), [106.0, 113.0])
+        self.assertEqual(make_catalog([106.0]).portes.tolist(), [0.0])
+
+    def test_explicit_product_price_column_wins_over_total(self):
+        export = pd.DataFrame({
+            "Nome": ["A"], "Preço c/ IVA": [106.0], "Portes": [4.9], "Preço total": [110.9],
+        })
+        catalog = load_catalog(excel_buffer(export))
+        self.assertEqual(catalog.preco.tolist(), [106.0])
+        self.assertEqual(catalog.portes.tolist(), [4.9])
+        self.assertEqual(catalog.preco_total.tolist(), [110.9])
+
+    def test_preco_total_is_preco_plus_portes(self):
+        catalog = make_catalog([106.0, 113.0], [6, 13], portes=[4.9, 0.0])
+        self.assertEqual(catalog.preco_total.tolist(), [110.9, 113.0])
+
     def test_excel_round_trip_keeps_true_and_false_choices(self):
-        catalog = make_catalog([49.2, 123.0], [23, 23], [True, False])
+        catalog = make_catalog([49.2, 123.0], [23, 23], [True, False], portes=[0.0, 3.9])
         export = catalog.rename(columns={
-            "nome": "Nome", "preco": "Preço total", "preco_s_iva": "Preço s/ IVA",
-            "taxa_iva": "Taxa IVA (%)", "iva_unit": "IVA (€)", "usar_iva": "Usar preço c/ IVA",
+            "nome": "Nome", "preco": "Preço c/ IVA", "preco_s_iva": "Preço s/ IVA",
+            "taxa_iva": "Taxa IVA (%)", "iva_unit": "IVA (€)", "portes": "Portes",
+            "preco_total": "Preço total", "usar_iva": "Usar preço c/ IVA",
         })
         loaded = load_catalog(excel_buffer(export))
         self.assertEqual(loaded.usar_iva.tolist(), [True, False])
@@ -300,7 +355,7 @@ class AppTests(unittest.TestCase):
         from unittest.mock import patch
         from streamlit.testing.v1 import AppTest
 
-        catalog = make_catalog([49.2, 113.0, 50.0], [23, 13, 23])
+        catalog = make_catalog([49.2, 113.0, 50.0], [23, 13, 23], portes=[5.0, 0.0, 0.0])
         offers = pd.Series(["Produto 0"] * 3 + ["Produto 1", "Produto 2"])
         upload = BytesIO()
 
@@ -316,18 +371,18 @@ class AppTests(unittest.TestCase):
             self.assertEqual(len(app.number_input), 0)
             self.assertEqual([metric.label for metric in app.metric], [
                 "Total rebates s/ IVA", "Total rebates c/ IVA", "Total rebates",
-                "IVA incluído no custo", "Ofertas resgatadas",
+                "Total portes", "Ofertas resgatadas",
             ])
-            self.assertEqual([metric.value for metric in app.metric], ["160,65 €", "113,00 €", "273,65 €", "13,00 €", "5"])
+            self.assertEqual([metric.value for metric in app.metric], ["175,65 €", "113,00 €", "288,65 €", "15,00 €", "5"])
             app.text_input(key="catalog_search").set_value("Produto 1").run()
             self.assertFalse(app.exception)
-            self.assertEqual([metric.value for metric in app.metric], ["160,65 €", "113,00 €", "273,65 €", "13,00 €", "5"])
+            self.assertEqual([metric.value for metric in app.metric], ["175,65 €", "113,00 €", "288,65 €", "15,00 €", "5"])
             pd.testing.assert_frame_equal(app.session_state["catalog"], catalog)
             cases = [
-                ([False, False, False], ["260,65 €", "0,00 €", "260,65 €", "0,00 €", "5"]),
-                ([True, True, True], ["0,00 €", "310,60 €", "310,60 €", "49,95 €", "5"]),
-                ([False, True, True], ["120,00 €", "163,00 €", "283,00 €", "22,35 €", "5"]),
-                ([False, True, False], ["160,65 €", "113,00 €", "273,65 €", "13,00 €", "5"]),
+                ([False, False, False], ["275,65 €", "0,00 €", "275,65 €", "15,00 €", "5"]),
+                ([True, True, True], ["0,00 €", "325,60 €", "325,60 €", "15,00 €", "5"]),
+                ([False, True, True], ["135,00 €", "163,00 €", "298,00 €", "15,00 €", "5"]),
+                ([False, True, False], ["175,65 €", "113,00 €", "288,65 €", "15,00 €", "5"]),
             ]
             for choices, expected in cases:
                 updated = catalog.copy()

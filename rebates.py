@@ -20,8 +20,13 @@ NET_COL = "preco_s_iva"
 VAT_COL = "iva_unit"
 VAT_RATE_COL = "taxa_iva"
 USE_VAT_COL = "usar_iva"
+SHIPPING_COL = "portes"
+TOTAL_COL = "preco_total"
+
 DEFAULT_VAT_RATE = 23.0
-CATALOG_COLUMNS = [NAME_COL, NET_COL, VAT_RATE_COL, VAT_COL, PRICE_COL, USE_VAT_COL]
+CATALOG_COLUMNS = [
+    NAME_COL, NET_COL, VAT_RATE_COL, VAT_COL, PRICE_COL, SHIPPING_COL, TOTAL_COL, USE_VAT_COL,
+]
 
 
 def round_money(value) -> float:
@@ -115,9 +120,14 @@ def _locate_columns(raw: pd.DataFrame):
         }
         name_c = next((c for k, c in labels.items() if k == "nome"), None)
         price_c = next(
-            (c for k, c in labels.items() if re.fullmatch(r"pre[cç]o(?: total.*| c/ iva.*)?", k)),
+            (c for k, c in labels.items() if re.fullmatch(r"pre[cç]o c/ iva.*", k)),
             None,
         )
+        if price_c is None:
+            price_c = next(
+                (c for k, c in labels.items() if re.fullmatch(r"pre[cç]o total.*", k)),
+                None,
+            )
         if price_c is None:
             price_c = next(
                 (c for k, c in labels.items() if re.fullmatch(r"pre[cç]o.*", k)), None
@@ -179,6 +189,17 @@ def load_catalog(source: Source, *, legacy_threshold: float = 50.0) -> pd.DataFr
         )
         if choice_c is not None:
             df[USE_VAT_COL] = raw.iloc[start:, choice_c]
+        portes_c = labels.get("portes")
+        if portes_c is not None:
+            df[SHIPPING_COL] = raw.iloc[start:, portes_c]
+            price_label = _norm_key(raw.iat[start - 1, price_c])
+            if "total" in price_label and "c/ iva" not in price_label:
+                # A 'Preço total' column already includes shipping: derive the
+                # product price so 'Preço c/ IVA' and 'Portes' stay authoritative.
+                df[PRICE_COL] = [
+                    round_money(normalize_price(total) - normalize_price(portes))
+                    for total, portes in zip(df[PRICE_COL], df[SHIPPING_COL])
+                ]
     return clean_catalog(df, legacy_threshold=legacy_threshold)
 
 
@@ -214,6 +235,8 @@ def summarize(ofertas: pd.Series, catalog: pd.DataFrame) -> pd.DataFrame:
                 "quantidade": int(qty),
                 "preco_unit": price,
                 "preco_unit_s_iva": product[NET_COL] if product is not None else 0.0,
+                SHIPPING_COL: product[SHIPPING_COL] if product is not None else 0.0,
+                TOTAL_COL: product[TOTAL_COL] if product is not None else 0.0,
                 VAT_RATE_COL: product[VAT_RATE_COL] if product is not None else 0.0,
                 USE_VAT_COL: product[USE_VAT_COL] if product is not None else False,
                 "total": round_money(price * qty),
@@ -222,7 +245,8 @@ def summarize(ofertas: pd.Series, catalog: pd.DataFrame) -> pd.DataFrame:
         )
     return (
         pd.DataFrame(rows, columns=[
-            "oferta", "quantidade", "preco_unit", "preco_unit_s_iva", VAT_RATE_COL, USE_VAT_COL, "total", "matched",
+            "oferta", "quantidade", "preco_unit", "preco_unit_s_iva", SHIPPING_COL,
+            TOTAL_COL, VAT_RATE_COL, USE_VAT_COL, "total", "matched",
         ])
         .sort_values("total", ascending=False)
         .reset_index(drop=True)
@@ -230,12 +254,18 @@ def summarize(ofertas: pd.Series, catalog: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_vat_split(df: pd.DataFrame) -> pd.DataFrame:
-    """Apply each product's VAT choice to rebate costs before multiplying by quantity."""
+    """Apply each product's VAT choice to rebate costs before multiplying by quantity.
+
+    Shipping is a flat amount on top of the product price: it is always part of
+    the cost, and only the product price is affected by the VAT choice.
+    """
     out = df.copy()
     includes_vat = out[USE_VAT_COL].map(_parse_use_vat).astype(bool)
-    out["preco_aplicado"] = out["preco_unit"].where(includes_vat, out["preco_unit_s_iva"])
+    net_cost = out["preco_unit_s_iva"] + out[SHIPPING_COL]
+    gross_cost = out["preco_unit"] + out[SHIPPING_COL]
+    out["preco_aplicado"] = gross_cost.where(includes_vat, net_cost)
     out["criterio"] = includes_vat.map({True: "Com IVA", False: "Sem IVA"})
-    out["total_s_iva"] = (out["preco_unit_s_iva"] * out["quantidade"]).map(round_money)
+    out["total_s_iva"] = (net_cost * out["quantidade"]).map(round_money)
     unit_vat = (out["preco_unit"] - out["preco_unit_s_iva"]).where(includes_vat, 0.0)
     out["iva"] = (unit_vat * out["quantidade"]).map(round_money)
     out["total"] = (out["preco_aplicado"] * out["quantidade"]).map(round_money)
@@ -256,6 +286,10 @@ def add_price_vat(df: pd.DataFrame, *, legacy_threshold: float = 50.0) -> pd.Dat
         for gross, rate in zip(out[PRICE_COL], out[VAT_RATE_COL])
     ]
     out[VAT_COL] = (out[PRICE_COL] - out[NET_COL]).map(round_money)
+    if SHIPPING_COL not in out:
+        out[SHIPPING_COL] = 0.0
+    out[SHIPPING_COL] = out[SHIPPING_COL].map(normalize_price).map(_parse_amount)
+    out[TOTAL_COL] = (out[PRICE_COL] + out[SHIPPING_COL]).map(round_money)
     choices = out.get(USE_VAT_COL, pd.Series(None, index=out.index, dtype=object)).astype(object)
     missing = choices.isna() | choices.eq("")
     defaults = out[PRICE_COL] > _parse_amount(legacy_threshold)
@@ -265,7 +299,7 @@ def add_price_vat(df: pd.DataFrame, *, legacy_threshold: float = 50.0) -> pd.Dat
 
 def edit_catalog_row(df: pd.DataFrame, row: int, column: str, value) -> pd.DataFrame:
     out = add_price_vat(df)
-    if column not in (NAME_COL, NET_COL, PRICE_COL, VAT_RATE_COL, USE_VAT_COL) or row not in out.index:
+    if column not in (NAME_COL, NET_COL, PRICE_COL, VAT_RATE_COL, SHIPPING_COL, USE_VAT_COL) or row not in out.index:
         raise ValueError("Produto ou coluna não editável.")
     if column == USE_VAT_COL:
         out.at[row, USE_VAT_COL] = _parse_use_vat(value)
@@ -280,6 +314,8 @@ def edit_catalog_row(df: pd.DataFrame, row: int, column: str, value) -> pd.DataF
         return out
     if column == VAT_RATE_COL:
         out.at[row, VAT_RATE_COL] = _parse_vat_rate(value)
+    elif column == SHIPPING_COL:
+        out.at[row, SHIPPING_COL] = _parse_amount(value)
     elif column == NET_COL:
         net = Decimal(str(_parse_amount(value)))
         rate = Decimal(str(out.at[row, VAT_RATE_COL]))
@@ -304,5 +340,8 @@ def add_missing(catalog: pd.DataFrame, names) -> pd.DataFrame:
             new.append(n)
     if not new:
         return catalog
-    extra = pd.DataFrame({NAME_COL: new, PRICE_COL: 0.0, VAT_RATE_COL: DEFAULT_VAT_RATE, USE_VAT_COL: False})
+    extra = pd.DataFrame({
+        NAME_COL: new, PRICE_COL: 0.0, VAT_RATE_COL: DEFAULT_VAT_RATE,
+        SHIPPING_COL: 0.0, USE_VAT_COL: False,
+    })
     return pd.concat([catalog, extra], ignore_index=True)

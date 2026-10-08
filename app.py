@@ -10,6 +10,8 @@ from persistence import commit_catalog
 from rebates import (
     DEFAULT_VAT_RATE,
     NAME_COL,
+    SHIPPING_COL,
+    TOTAL_COL,
     USE_VAT_COL,
     VAT_RATE_COL,
     add_missing,
@@ -19,6 +21,7 @@ from rebates import (
     edit_catalog_row,
     load_catalog,
     load_ofertas,
+    round_money,
     summarize,
 )
 
@@ -55,8 +58,10 @@ def catalog_export(catalog: pd.DataFrame) -> pd.DataFrame:
             "nome": "Nome",
             VAT_RATE_COL: "Taxa IVA (%)",
             "iva_unit": "IVA (€)",
+            "preco": "Preço c/ IVA",
+            SHIPPING_COL: "Portes",
+            TOTAL_COL: "Preço total",
             "preco_s_iva": "Preço s/ IVA",
-            "preco": "Preço total",
             USE_VAT_COL: "Usar preço c/ IVA",
         }
     )
@@ -233,19 +238,23 @@ with tab_rebates:
                 "já multiplicado pelas quantidades resgatadas.",
             )
             st.metric("Total rebates", format_eur(summary["total"].sum()))
-            st.metric("IVA incluído no custo", format_eur(summary["iva"].sum()))
+            st.metric(
+                "Total portes",
+                format_eur(round_money((summary[SHIPPING_COL] * summary["quantidade"]).sum())),
+            )
             st.metric("Ofertas resgatadas", int(summary["quantidade"].sum()))
 
         summary_columns = [
-            "oferta", "quantidade", VAT_RATE_COL, "preco_unit", "preco_aplicado",
-            "criterio", "total_s_iva", "iva", "total",
+            "oferta", "quantidade", VAT_RATE_COL, "preco_unit", SHIPPING_COL,
+            "preco_aplicado", "criterio", "total_s_iva", "iva", "total",
         ]
         summary_labels = {
             "oferta": "Oferta",
             "quantidade": "Quantidade",
             VAT_RATE_COL: "Taxa IVA (%)",
-            "preco_unit": "Preço catálogo (c/ IVA)",
-            "preco_unit_s_iva": "Preço catálogo (s/ IVA)",
+            "preco_unit": "Preço produto c/ IVA",
+            "preco_unit_s_iva": "Preço produto s/ IVA",
+            SHIPPING_COL: "Portes (€)",
             "preco_aplicado": "Custo unitário aplicado",
             "criterio": "Critério aplicado",
             "total_s_iva": "Base s/ IVA",
@@ -254,7 +263,7 @@ with tab_rebates:
         }
         st.dataframe(
             summary[summary_columns].style.format(
-                {column: format_eur for column in ["preco_unit", "preco_aplicado", "total_s_iva", "iva", "total"]}
+                {column: format_eur for column in ["preco_unit", SHIPPING_COL, "preco_aplicado", "total_s_iva", "iva", "total"]}
             ),
             column_config={
                 **summary_labels,
@@ -298,7 +307,7 @@ with tab_rebates:
 
         export = summary.reindex(columns=[
             "oferta", "quantidade", VAT_RATE_COL, "preco_unit", "preco_unit_s_iva",
-            "preco_aplicado", "criterio", "total_s_iva", "iva", "total",
+            SHIPPING_COL, "preco_aplicado", "criterio", "total_s_iva", "iva", "total",
         ]).rename(columns=summary_labels)
         st.download_button(
             "Download resumo (Excel)",
@@ -334,8 +343,9 @@ with tab_catalog:
         st.caption(
             f"{len(catalog)} prémios — preços em euros; clica numa célula para editar, "
             "ou escreve o nome na última linha para adicionar um produto. "
-            "Alterar a taxa mantém o preço total e recalcula o preço s/ IVA. "
-            "Alterar o preço s/ IVA atualiza o total. O IVA em euros é calculado automaticamente. "
+            "Alterar a taxa mantém o preço c/ IVA e recalcula o preço s/ IVA. "
+            "Alterar o preço s/ IVA atualiza o preço c/ IVA. O IVA em euros é calculado "
+            "automaticamente. Preço total = Preço c/ IVA + Portes. "
             "Clica num cabeçalho para ordenar; a linha para adicionar produtos fica fixa no fundo."
         )
         catalog_editor(
