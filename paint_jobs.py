@@ -42,16 +42,20 @@ class PaintJob(BaseModel):
 
 
 PROMPT = """\
-Analisa este Caderno de Encargos e extrai TODOS os trabalhos de pintura: \
+Analisa os documentos anexos (Caderno de Encargos e, quando incluídos, Mapa \
+de Quantidades ou Medições) e extrai TODOS os trabalhos de pintura: \
 pintura de paredes, tetos, fachadas, carpintarias, serralharias, barramentos, \
-primários e preparação de superfícies diretamente associada à pintura.
+primários e preparação de superfícies diretamente associada à pintura. \
+Cruza a informação entre documentos quando necessário.
 
 Regras:
 - Inclui apenas trabalhos de pintura. Não incluas rebocos, estuques, \
 revestimentos cerâmicos, pavimentos, impermeabilizações nem outros trabalhos.
 - Mantém a descrição completa do documento, incluindo tipo de tinta, número \
 de demãos, marca/sistema especificado e superfície a pintar.
-- Se a quantidade não estiver indicada no documento, usa null.
+- As quantidades são críticas: extrai sempre a área em m2 (e outras unidades) \
+quando o documento as indica, incluindo em mapas de quantidades ou medições \
+anexos. Se a quantidade não estiver indicada no documento, usa null.
 - Se um artigo abranger várias sub-alíneas de pintura, extrai cada uma \
 separadamente.
 - Se o documento não contiver trabalhos de pintura, devolve uma lista vazia.
@@ -82,21 +86,25 @@ def _loads_json(text: str):
     return json.loads(text)
 
 
-def _extract_gemini(pdf_bytes: bytes, api_key: str, model: str) -> pd.DataFrame:
+def _extract_gemini(docs: list[tuple[str, bytes]], api_key: str, model: str) -> pd.DataFrame:
     from google import genai
 
     client = genai.Client(api_key=api_key)
+    uploaded = []
     try:
-        doc = client.files.upload(
-            file=BytesIO(pdf_bytes),
-            config={"mime_type": "application/pdf", "display_name": "caderno_encargos.pdf"},
-        )
+        for name, data in docs:
+            uploaded.append(
+                client.files.upload(
+                    file=BytesIO(data),
+                    config={"mime_type": "application/pdf", "display_name": name},
+                )
+            )
     except Exception as e:
-        raise ValueError(f"Não foi possível enviar o PDF: {e}") from e
+        raise ValueError(f"Não foi possível enviar o(s) PDF(s): {e}") from e
     try:
         response = client.models.generate_content(
             model=model,
-            contents=[doc, PROMPT],
+            contents=[*uploaded, PROMPT],
             config={
                 "response_mime_type": "application/json",
                 "response_schema": list[PaintJob],
@@ -105,14 +113,15 @@ def _extract_gemini(pdf_bytes: bytes, api_key: str, model: str) -> pd.DataFrame:
     except Exception as e:
         raise ValueError(f"Falha na extração com o Gemini: {e}") from e
     finally:
-        try:
-            client.files.delete(name=doc.name)
-        except Exception:
-            pass
+        for doc in uploaded:
+            try:
+                client.files.delete(name=doc.name)
+            except Exception:
+                pass
     return parse_jobs(response.parsed)
 
 
-def _extract_claude(pdf_bytes: bytes, api_key: str, model: str) -> pd.DataFrame:
+def _extract_claude(docs: list[tuple[str, bytes]], api_key: str, model: str) -> pd.DataFrame:
     import anthropic
 
     client = anthropic.Anthropic(api_key=api_key)
@@ -124,14 +133,17 @@ def _extract_claude(pdf_bytes: bytes, api_key: str, model: str) -> pd.DataFrame:
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "document",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "application/pdf",
-                                "data": base64.standard_b64encode(pdf_bytes).decode(),
-                            },
-                        },
+                        *[
+                            {
+                                "type": "document",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "application/pdf",
+                                    "data": base64.standard_b64encode(data).decode(),
+                                },
+                            }
+                            for _, data in docs
+                        ],
                         {"type": "text", "text": PROMPT + "\n\n" + JSON_INSTRUCTION},
                     ],
                 }
@@ -145,7 +157,7 @@ def _extract_claude(pdf_bytes: bytes, api_key: str, model: str) -> pd.DataFrame:
     return parse_jobs(payload)
 
 
-def _extract_openai(pdf_bytes: bytes, api_key: str, model: str) -> pd.DataFrame:
+def _extract_openai(docs: list[tuple[str, bytes]], api_key: str, model: str) -> pd.DataFrame:
     from openai import OpenAI
 
     client = OpenAI(api_key=api_key)
@@ -168,14 +180,17 @@ def _extract_openai(pdf_bytes: bytes, api_key: str, model: str) -> pd.DataFrame:
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "input_file",
-                            "filename": "caderno_encargos.pdf",
-                            "file_data": (
-                                "data:application/pdf;base64,"
-                                + base64.standard_b64encode(pdf_bytes).decode()
-                            ),
-                        },
+                        *[
+                            {
+                                "type": "input_file",
+                                "filename": name,
+                                "file_data": (
+                                    "data:application/pdf;base64,"
+                                    + base64.standard_b64encode(data).decode()
+                                ),
+                            }
+                            for name, data in docs
+                        ],
                         {"type": "input_text", "text": PROMPT},
                     ],
                 }
@@ -209,6 +224,8 @@ _EXTRACTORS = {
 }
 
 
-def extract_paint_jobs(pdf_bytes: bytes, api_key: str, provider: str, model: str) -> pd.DataFrame:
-    """Send the PDF to the chosen provider and return the extracted paint jobs."""
-    return _EXTRACTORS[provider](pdf_bytes, api_key, model)
+def extract_paint_jobs(
+    docs: list[tuple[str, bytes]], api_key: str, provider: str, model: str
+) -> pd.DataFrame:
+    """Send the PDFs (name, bytes) to the chosen provider; return the paint jobs."""
+    return _EXTRACTORS[provider](docs, api_key, model)

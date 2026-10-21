@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from catalog_editor import catalog_editor
-from paint_jobs import JOB_LABELS, PROVIDERS, extract_paint_jobs
+from paint_jobs import JOB_COLUMNS, JOB_LABELS, PROVIDERS, extract_paint_jobs
 from persistence import commit_catalog
 from rebates import (
     DEFAULT_VAT_RATE,
@@ -425,30 +425,40 @@ with tab_catalog:
 with tab_paint:
     with st.container(border=True):
         st.subheader("Trabalhos de pintura")
-        paint_file = st.file_uploader(
-            "Caderno de Encargos (PDF)", type=["pdf"], label_visibility="collapsed"
+        paint_files = st.file_uploader(
+            "Caderno de Encargos (PDF)",
+            type=["pdf"],
+            accept_multiple_files=True,
+            label_visibility="collapsed",
         )
         provider_col, model_col = st.columns(2)
         provider = provider_col.selectbox("Fornecedor de IA", list(PROVIDERS))
         model = model_col.selectbox("Modelo", PROVIDERS[provider]["models"])
         st.caption(
             "Extrai os trabalhos de pintura de um Caderno de Encargos com IA. "
-            "Revê e edita a tabela antes de exportar."
+            "Se as quantidades estiverem noutro documento (Mapa de Quantidades/"
+            "Medições), carrega os PDFs juntos. Revê e edita a tabela antes de exportar."
         )
 
     secret = PROVIDERS[provider]["secret"]
     api_key = llm_api_key(secret)
-    if paint_file is None:
-        st.info("Carrega o PDF do Caderno de Encargos para extrair os trabalhos de pintura.")
+    if not paint_files:
+        st.info(
+            "Carrega o PDF do Caderno de Encargos — e o Mapa de Quantidades, "
+            "se for um documento separado."
+        )
     elif not api_key:
         st.error(
             f"Extração não configurada: define {secret} nas secrets da app "
             "(ou na variável de ambiente)."
         )
     else:
-        # Extraction results live in session state, keyed by file, so reruns
-        # and edits do not repeat the LLM call.
-        paint_src = ("paint", paint_file.name, getattr(paint_file, "file_id", paint_file.size))
+        # Extraction results live in session state, keyed by the uploaded
+        # files, so reruns and edits do not repeat the LLM call.
+        paint_src = (
+            "paint",
+            tuple((f.name, getattr(f, "file_id", f.size)) for f in paint_files),
+        )
         if st.session_state.get("paint_src") != paint_src:
             st.session_state.paint_src = paint_src
             st.session_state.pop("paint_jobs", None)
@@ -460,9 +470,14 @@ with tab_paint:
             st.session_state.pop("paint_error", None)
             with st.spinner("A analisar o documento…"):
                 try:
-                    st.session_state.paint_jobs = extract_paint_jobs(
-                        paint_file.getvalue(), api_key, provider, model
+                    df = extract_paint_jobs(
+                        [(f.name, f.getvalue()) for f in paint_files],
+                        api_key,
+                        provider,
+                        model,
                     )
+                    df.insert(0, "exportar", True)
+                    st.session_state.paint_jobs = df
                 except ValueError as e:
                     st.session_state.paint_error = str(e)
             st.session_state["paint_version"] += 1
@@ -474,24 +489,55 @@ with tab_paint:
         if paint_jobs is not None:
             if paint_jobs.empty:
                 st.warning("Não foram encontrados trabalhos de pintura no documento.")
-            edited = st.data_editor(
-                paint_jobs,
-                num_rows="dynamic",
-                hide_index=True,
-                width="stretch",
-                column_config={
-                    "capitulo": st.column_config.TextColumn(JOB_LABELS["capitulo"]),
-                    "artigo": st.column_config.TextColumn(JOB_LABELS["artigo"], width="small"),
-                    "descricao": st.column_config.TextColumn(JOB_LABELS["descricao"], width="large"),
-                    "unidade": st.column_config.TextColumn(JOB_LABELS["unidade"], width="small"),
-                    "quantidade": st.column_config.NumberColumn(JOB_LABELS["quantidade"]),
-                },
-                key=f"paint_jobs_editor_{st.session_state.paint_version}",
-            )
-            st.download_button(
-                "Download trabalhos (Excel)",
-                icon="📥",
-                data=to_xlsx_bytes(edited.rename(columns=JOB_LABELS)),
-                file_name="trabalhos_pintura.xlsx",
-                mime=XLSX_MIME,
-            )
+            preview_col, table_col = st.columns([2, 3])
+            with preview_col:
+                if len(paint_files) > 1:
+                    preview_name = st.selectbox(
+                        "Documento",
+                        [f.name for f in paint_files],
+                        key=f"paint_preview_{st.session_state.paint_version}",
+                    )
+                else:
+                    preview_name = paint_files[0].name
+                preview = next(f for f in paint_files if f.name == preview_name)
+                st.pdf(preview.getvalue(), height=700)
+            with table_col:
+                st.caption(
+                    "Desmarca as linhas que não interessam — só as marcadas entram no Excel."
+                )
+                edited = st.data_editor(
+                    paint_jobs,
+                    num_rows="dynamic",
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "exportar": st.column_config.CheckboxColumn(
+                            "Exportar", default=True, width="small"
+                        ),
+                        "capitulo": st.column_config.TextColumn(JOB_LABELS["capitulo"]),
+                        "artigo": st.column_config.TextColumn(JOB_LABELS["artigo"], width="small"),
+                        "descricao": st.column_config.TextColumn(JOB_LABELS["descricao"], width="large"),
+                        "unidade": st.column_config.TextColumn(JOB_LABELS["unidade"], width="small"),
+                        "quantidade": st.column_config.NumberColumn(JOB_LABELS["quantidade"]),
+                    },
+                    key=f"paint_jobs_editor_{st.session_state.paint_version}",
+                )
+                selected = edited[edited["exportar"].fillna(False)]
+                m2_rows = selected["unidade"].astype(str).str.strip().str.lower().isin(
+                    {"m2", "m²", "m^2", "mq"}
+                )
+                if m2_rows.any():
+                    st.metric(
+                        "Área selecionada",
+                        f"{selected.loc[m2_rows, 'quantidade'].sum():,.2f} m²".translate(EUR_SEPARATORS),
+                    )
+                st.download_button(
+                    "Download trabalhos (Excel)",
+                    icon="📥",
+                    data=to_xlsx_bytes(
+                        selected.reindex(columns=JOB_COLUMNS).rename(columns=JOB_LABELS)
+                    ),
+                    file_name="trabalhos_pintura.xlsx",
+                    mime=XLSX_MIME,
+                    disabled=selected.empty,
+                )
